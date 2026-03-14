@@ -25,6 +25,7 @@ type config struct {
 	OpenAQAPIKey    string
 	OpenAQCountryID int
 	OpenAQLimit     int
+	OpenAQCity      string
 	Country         string
 	KafkaRESTURL    string
 	KafkaTopic      string
@@ -199,10 +200,20 @@ func fetchOpenAQV3Results(ctx context.Context, client *http.Client, cfg config) 
 		return nil, err
 	}
 
-	locationsURL := fmt.Sprintf("%s/locations?countries_id=%d&limit=%d", base, cfg.OpenAQCountryID, cfg.OpenAQLimit)
+	params := url.Values{}
+	params.Set("countries_id", strconv.Itoa(cfg.OpenAQCountryID))
+	params.Set("limit", strconv.Itoa(cfg.OpenAQLimit))
+	if city := strings.TrimSpace(cfg.OpenAQCity); city != "" {
+		params.Set("cities", city)
+	}
+	locationsURL := fmt.Sprintf("%s/locations?%s", base, params.Encode())
 	locations, err := fetchOpenAQLocations(ctx, client, locationsURL, cfg.OpenAQAPIKey)
 	if err != nil {
 		return nil, err
+	}
+	locations = filterLocationsByCity(locations, cfg.OpenAQCity)
+	if len(locations) == 0 {
+		return nil, fmt.Errorf("no OpenAQ locations found for city=%q", cfg.OpenAQCity)
 	}
 	results := make([]map[string]any, 0, len(locations))
 	for _, loc := range locations {
@@ -245,6 +256,24 @@ func fetchOpenAQLocations(ctx context.Context, client *http.Client, endpoint, ap
 		return nil, fmt.Errorf("decode locations response: %w", err)
 	}
 	return payload.Results, nil
+}
+
+func filterLocationsByCity(locations []map[string]any, city string) []map[string]any {
+	city = strings.ToLower(strings.TrimSpace(city))
+	if city == "" {
+		return locations
+	}
+	filtered := make([]map[string]any, 0, len(locations))
+	for _, loc := range locations {
+		name, _ := loc["name"].(string)
+		locality, _ := loc["locality"].(string)
+		timezone, _ := loc["timezone"].(string)
+		haystack := strings.ToLower(strings.TrimSpace(name + " " + locality + " " + timezone))
+		if strings.Contains(haystack, city) {
+			filtered = append(filtered, loc)
+		}
+	}
+	return filtered
 }
 
 func buildResultFromLocation(ctx context.Context, client *http.Client, base, apiKey string, location map[string]any, countryCode string) (map[string]any, bool) {
@@ -665,7 +694,8 @@ func loadConfig() config {
 		OpenAQURL:       getEnv("OPENAQ_URL", "https://api.openaq.org/v3"),
 		OpenAQAPIKey:    getEnv("OPENAQ_API_KEY", ""),
 		OpenAQCountryID: getIntEnv("OPENAQ_COUNTRY_ID", 111),
-		OpenAQLimit:     getIntEnv("OPENAQ_LOCATION_LIMIT", 20),
+		OpenAQLimit:     getIntEnv("OPENAQ_LOCATION_LIMIT", 3),
+		OpenAQCity:      getEnv("OPENAQ_CITY", ""),
 		Country:         getEnv("OPENAQ_COUNTRY", "TH"),
 		KafkaRESTURL:    getEnv("KAFKA_REST_URL", "http://kafka-rest:8082"),
 		KafkaTopic:      getEnv("KAFKA_TOPIC", "openaq.th.latest"),

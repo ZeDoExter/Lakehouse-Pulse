@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -46,7 +47,7 @@ func (a *AirQualityTool) LatestByCity(ctx context.Context, city string) (LatestA
 	if a.APIKey == "" {
 		return LatestAirQualityResponse{}, fmt.Errorf("OPENAQ_API_KEY is required for OpenAQ v3")
 	}
-	locations, err := a.fetchLocations(ctx)
+	locations, err := a.fetchLocations(ctx, city)
 	if err != nil {
 		return LatestAirQualityResponse{}, err
 	}
@@ -127,12 +128,18 @@ func (a *AirQualityTool) LatestByCity(ctx context.Context, city string) (LatestA
 	return LatestAirQualityResponse{}, fmt.Errorf("city=%q found but no pollutant measurements available", city)
 }
 
-func (a *AirQualityTool) fetchLocations(ctx context.Context) ([]map[string]any, error) {
+func (a *AirQualityTool) fetchLocations(ctx context.Context, city string) ([]map[string]any, error) {
 	base, err := a.baseURL()
 	if err != nil {
 		return nil, err
 	}
-	locationsURL := fmt.Sprintf("%s/locations?countries_id=%d&limit=%d", base, a.CountryID, a.Limit)
+	params := url.Values{}
+	params.Set("countries_id", strconv.Itoa(a.CountryID))
+	params.Set("limit", strconv.Itoa(a.Limit))
+	if city = strings.TrimSpace(city); city != "" {
+		params.Set("cities", city)
+	}
+	locationsURL := fmt.Sprintf("%s/locations?%s", base, params.Encode())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, locationsURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build locations request: %w", err)
