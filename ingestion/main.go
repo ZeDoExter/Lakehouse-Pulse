@@ -17,6 +17,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type config struct {
@@ -36,49 +39,96 @@ type config struct {
 	ShutdownTimeout time.Duration
 }
 
-type openAQResponse struct {
-	Results []map[string]any `json:"results"`
-}
-
-type kafkaRESTPayload struct {
-	Records []kafkaRESTRecord `json:"records"`
-}
-
-type kafkaRESTRecord struct {
-	Value map[string]any `json:"value"`
-}
-
 type metricState struct {
-	mu                  sync.Mutex
-	runTotal            uint64
-	runErrors           uint64
-	fetchErrors         uint64
-	publishTotal        uint64
-	publishErrors       uint64
-	consecutiveFailures uint64
-	lastSuccessUnix     int64
-	durationBuckets     []uint64
-	durationCount       uint64
-	durationSum         float64
-	pm25Avg             float64
-	pm10Avg             float64
-	coAvg               float64
-	airQualityUpdatedAt int64
+	runTotal            prometheus.Counter
+	runErrors           prometheus.Counter
+	fetchErrors         prometheus.Counter
+	publishTotal        prometheus.Counter
+	publishErrors       prometheus.Counter
+	runDuration         prometheus.Histogram
+	lastSuccess         prometheus.Gauge
+	consecutiveFailures prometheus.Gauge
+	pm25Avg             prometheus.Gauge
+	pm10Avg             prometheus.Gauge
+	coAvg               prometheus.Gauge
+	airQualityUpdatedAt prometheus.Gauge
+
+	mu                 sync.Mutex
+	lastSuccessUnix    int64
+	currentConsecutive uint64
 }
 
-var durationBucketBounds = []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
+func newMetricState() *metricState {
+	m := &metricState{
+		runTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lakehouse_pulse_ingestion_runs_total",
+			Help: "Total ingestion polling runs.",
+		}),
+		runErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lakehouse_pulse_ingestion_run_errors_total",
+			Help: "Total ingestion runs that ended in error.",
+		}),
+		fetchErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lakehouse_pulse_ingestion_fetch_errors_total",
+			Help: "Total OpenAQ fetch errors across retries.",
+		}),
+		publishTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lakehouse_pulse_ingestion_publish_total",
+			Help: "Total successfully published Kafka records.",
+		}),
+		publishErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lakehouse_pulse_ingestion_publish_errors_total",
+			Help: "Total Kafka publish errors across retries.",
+		}),
+		runDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "lakehouse_pulse_ingestion_run_duration_seconds",
+			Help:    "Duration of ingestion runs in seconds.",
+			Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+		}),
+		lastSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "lakehouse_pulse_ingestion_last_success_timestamp_seconds",
+			Help: "Unix timestamp of the last successful run.",
+		}),
+		consecutiveFailures: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "lakehouse_pulse_ingestion_consecutive_failures",
+			Help: "Current consecutive failed-run count.",
+		}),
+		pm25Avg: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "lakehouse_pulse_air_quality_pm25_avg",
+			Help: "Latest average PM2.5 value from fetched OpenAQ records.",
+		}),
+		pm10Avg: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "lakehouse_pulse_air_quality_pm10_avg",
+			Help: "Latest average PM10 value from fetched OpenAQ records.",
+		}),
+		coAvg: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "lakehouse_pulse_air_quality_co_avg",
+			Help: "Latest average CO value from fetched OpenAQ records.",
+		}),
+		airQualityUpdatedAt: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "lakehouse_pulse_air_quality_updated_at_timestamp_seconds",
+			Help: "Last timestamp when air quality gauges were updated.",
+		}),
+	}
+	prometheus.MustRegister(
+		m.runTotal, m.runErrors, m.fetchErrors, m.publishTotal, m.publishErrors,
+		m.runDuration, m.lastSuccess, m.consecutiveFailures,
+		m.pm25Avg, m.pm10Avg, m.coAvg, m.airQualityUpdatedAt,
+	)
+	return m
+}
 
 func main() {
 	cfg := loadConfig()
 	logger := log.New(os.Stdout, "ingestion ", log.LstdFlags|log.LUTC)
-	metrics := &metricState{durationBuckets: make([]uint64, len(durationBucketBounds))}
+	metrics := newMetricState()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler(metrics, cfg.PollInterval))
-	mux.HandleFunc("/metrics", metrics.handler)
+	mux.Handle("/metrics", promhttp.Handler())
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -251,7 +301,9 @@ func fetchOpenAQLocations(ctx context.Context, client *http.Client, endpoint, ap
 		return nil, fmt.Errorf("locations status=%d body=%s", resp.StatusCode, truncate(string(body), 300))
 	}
 
-	var payload openAQResponse
+	var payload struct {
+		Results []map[string]any `json:"results"`
+	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("decode locations response: %w", err)
 	}
@@ -265,9 +317,18 @@ func filterLocationsByCity(locations []map[string]any, city string) []map[string
 	}
 	filtered := make([]map[string]any, 0, len(locations))
 	for _, loc := range locations {
-		name, _ := loc["name"].(string)
-		locality, _ := loc["locality"].(string)
-		timezone, _ := loc["timezone"].(string)
+		name, ok := loc["name"].(string)
+		if !ok {
+			name = ""
+		}
+		locality, ok := loc["locality"].(string)
+		if !ok {
+			locality = ""
+		}
+		timezone, ok := loc["timezone"].(string)
+		if !ok {
+			timezone = ""
+		}
 		haystack := strings.ToLower(strings.TrimSpace(name + " " + locality + " " + timezone))
 		if strings.Contains(haystack, city) {
 			filtered = append(filtered, loc)
@@ -277,27 +338,28 @@ func filterLocationsByCity(locations []map[string]any, city string) []map[string
 }
 
 func buildResultFromLocation(ctx context.Context, client *http.Client, base, apiKey string, location map[string]any, countryCode string) (map[string]any, bool) {
-	sensors, ok := location["sensors"].([]any)
-	if !ok || len(sensors) == 0 {
+	locationIDRaw, ok := readFloatAny(location["id"])
+	if !ok {
+		return nil, false
+	}
+	locationID := int(locationIDRaw)
+
+	measurementsRaw, ok := fetchLocationLatest(ctx, client, base, apiKey, locationID)
+	if !ok || len(measurementsRaw) == 0 {
 		return nil, false
 	}
 
 	measurements := make([]map[string]any, 0, 3)
 	seen := map[string]bool{}
-	for _, sensorItem := range sensors {
-		sensor, ok := sensorItem.(map[string]any)
+	for _, mRaw := range measurementsRaw {
+		parameterObj, ok := mRaw["parameter"].(map[string]any)
 		if !ok {
 			continue
 		}
-		sensorIDRaw, ok := readFloatAny(sensor["id"])
+		parameterName, ok := parameterObj["name"].(string)
 		if !ok {
 			continue
 		}
-		parameterObj, ok := sensor["parameter"].(map[string]any)
-		if !ok {
-			continue
-		}
-		parameterName, _ := parameterObj["name"].(string)
 		parameterName = strings.ToLower(strings.TrimSpace(parameterName))
 		if parameterName != "pm25" && parameterName != "pm10" && parameterName != "co" {
 			continue
@@ -305,11 +367,27 @@ func buildResultFromLocation(ctx context.Context, client *http.Client, base, api
 		if seen[parameterName] {
 			continue
 		}
-		units, _ := parameterObj["units"].(string)
-		value, updatedAt, err := fetchSensorHour(ctx, client, base, apiKey, int(sensorIDRaw))
-		if err != nil {
+		units, ok := parameterObj["units"].(string)
+		if !ok {
+			units = ""
+		}
+		value, ok := readFloatAny(mRaw["value"])
+		if !ok {
 			continue
 		}
+		period, ok := mRaw["period"].(map[string]any)
+		if !ok {
+			continue
+		}
+		datetimeTo, ok := period["datetimeTo"].(map[string]any)
+		if !ok {
+			continue
+		}
+		updatedAt, ok := datetimeTo["utc"].(string)
+		if !ok {
+			continue
+		}
+
 		seen[parameterName] = true
 		measurements = append(measurements, map[string]any{
 			"parameter":   parameterName,
@@ -321,12 +399,19 @@ func buildResultFromLocation(ctx context.Context, client *http.Client, base, api
 			break
 		}
 	}
+
 	if len(measurements) == 0 {
 		return nil, false
 	}
 
-	locationName, _ := location["name"].(string)
-	locality, _ := location["locality"].(string)
+	locationName, ok := location["name"].(string)
+	if !ok {
+		locationName = ""
+	}
+	locality, ok := location["locality"].(string)
+	if !ok {
+		locality = ""
+	}
 	city := locality
 	if strings.TrimSpace(city) == "" {
 		city = locationName
@@ -357,44 +442,34 @@ func buildResultFromLocation(ctx context.Context, client *http.Client, base, api
 	}, true
 }
 
-func fetchSensorHour(ctx context.Context, client *http.Client, base, apiKey string, sensorID int) (float64, string, error) {
-	endpoint := fmt.Sprintf("%s/sensors/%d/hours?limit=1", base, sensorID)
+func fetchLocationLatest(ctx context.Context, client *http.Client, base, apiKey string, locationID int) ([]map[string]any, bool) {
+	endpoint := fmt.Sprintf("%s/locations/%d/latest", base, locationID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return 0, "", fmt.Errorf("build sensor request: %w", err)
+		return nil, false
 	}
 	req.Header.Set("X-API-Key", apiKey)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, "", fmt.Errorf("request sensor: %w", err)
+		return nil, false
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0, "", fmt.Errorf("read sensor response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return 0, "", fmt.Errorf("sensor status=%d body=%s", resp.StatusCode, truncate(string(body), 240))
+		return nil, false
 	}
 
 	var payload struct {
-		Results []struct {
-			Value  float64 `json:"value"`
-			Period struct {
-				DateTimeTo struct {
-					UTC string `json:"utc"`
-				} `json:"datetimeTo"`
-			} `json:"period"`
-		} `json:"results"`
+		Results []map[string]any `json:"results"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return 0, "", fmt.Errorf("decode sensor response: %w", err)
+		return nil, false
 	}
-	if len(payload.Results) == 0 {
-		return 0, "", fmt.Errorf("sensor has no data")
-	}
-	return payload.Results[0].Value, payload.Results[0].Period.DateTimeTo.UTC, nil
+	return payload.Results, true
 }
 
 func openAQBaseURL(value string) (string, error) {
@@ -450,7 +525,15 @@ func publishWithRetry(ctx context.Context, cfg config, metrics *metricState, mes
 
 func publishKafkaREST(ctx context.Context, cfg config, message map[string]any) error {
 	endpoint := fmt.Sprintf("%s/topics/%s", strings.TrimRight(cfg.KafkaRESTURL, "/"), cfg.KafkaTopic)
-	payloadBytes, err := json.Marshal(kafkaRESTPayload{Records: []kafkaRESTRecord{{Value: message}}})
+	payloadBytes, err := json.Marshal(struct {
+		Records []struct {
+			Value map[string]any `json:"value"`
+		} `json:"records"`
+	}{
+		Records: []struct {
+			Value map[string]any `json:"value"`
+		}{{Value: message}},
+	})
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
@@ -505,121 +588,40 @@ func healthHandler(metrics *metricState, pollInterval time.Duration) http.Handle
 	}
 }
 
-func (m *metricState) handler(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	_, _ = w.Write([]byte(m.renderPrometheus()))
-}
-
-func (m *metricState) renderPrometheus() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	var b strings.Builder
-
-	b.WriteString("# HELP lakehouse_pulse_ingestion_runs_total Total ingestion polling runs.\n")
-	b.WriteString("# TYPE lakehouse_pulse_ingestion_runs_total counter\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_ingestion_runs_total %d\n", m.runTotal))
-
-	b.WriteString("# HELP lakehouse_pulse_ingestion_run_errors_total Total ingestion runs that ended in error.\n")
-	b.WriteString("# TYPE lakehouse_pulse_ingestion_run_errors_total counter\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_ingestion_run_errors_total %d\n", m.runErrors))
-
-	b.WriteString("# HELP lakehouse_pulse_ingestion_fetch_errors_total Total OpenAQ fetch errors across retries.\n")
-	b.WriteString("# TYPE lakehouse_pulse_ingestion_fetch_errors_total counter\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_ingestion_fetch_errors_total %d\n", m.fetchErrors))
-
-	b.WriteString("# HELP lakehouse_pulse_ingestion_publish_total Total successfully published Kafka records.\n")
-	b.WriteString("# TYPE lakehouse_pulse_ingestion_publish_total counter\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_ingestion_publish_total %d\n", m.publishTotal))
-
-	b.WriteString("# HELP lakehouse_pulse_ingestion_publish_errors_total Total Kafka publish errors across retries.\n")
-	b.WriteString("# TYPE lakehouse_pulse_ingestion_publish_errors_total counter\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_ingestion_publish_errors_total %d\n", m.publishErrors))
-
-	b.WriteString("# HELP lakehouse_pulse_ingestion_run_duration_seconds Duration of ingestion runs in seconds.\n")
-	b.WriteString("# TYPE lakehouse_pulse_ingestion_run_duration_seconds histogram\n")
-	cumulative := uint64(0)
-	for idx, bound := range durationBucketBounds {
-		cumulative += m.durationBuckets[idx]
-		b.WriteString(fmt.Sprintf("lakehouse_pulse_ingestion_run_duration_seconds_bucket{le=\"%.2f\"} %d\n", bound, cumulative))
-	}
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_ingestion_run_duration_seconds_bucket{le=\"+Inf\"} %d\n", m.durationCount))
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_ingestion_run_duration_seconds_sum %.6f\n", m.durationSum))
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_ingestion_run_duration_seconds_count %d\n", m.durationCount))
-
-	b.WriteString("# HELP lakehouse_pulse_ingestion_last_success_timestamp_seconds Unix timestamp of the last successful run.\n")
-	b.WriteString("# TYPE lakehouse_pulse_ingestion_last_success_timestamp_seconds gauge\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_ingestion_last_success_timestamp_seconds %d\n", m.lastSuccessUnix))
-
-	b.WriteString("# HELP lakehouse_pulse_ingestion_consecutive_failures Current consecutive failed-run count.\n")
-	b.WriteString("# TYPE lakehouse_pulse_ingestion_consecutive_failures gauge\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_ingestion_consecutive_failures %d\n", m.consecutiveFailures))
-
-	b.WriteString("# HELP lakehouse_pulse_air_quality_pm25_avg Latest average PM2.5 value from fetched OpenAQ records.\n")
-	b.WriteString("# TYPE lakehouse_pulse_air_quality_pm25_avg gauge\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_air_quality_pm25_avg %.6f\n", m.pm25Avg))
-
-	b.WriteString("# HELP lakehouse_pulse_air_quality_pm10_avg Latest average PM10 value from fetched OpenAQ records.\n")
-	b.WriteString("# TYPE lakehouse_pulse_air_quality_pm10_avg gauge\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_air_quality_pm10_avg %.6f\n", m.pm10Avg))
-
-	b.WriteString("# HELP lakehouse_pulse_air_quality_co_avg Latest average CO value from fetched OpenAQ records.\n")
-	b.WriteString("# TYPE lakehouse_pulse_air_quality_co_avg gauge\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_air_quality_co_avg %.6f\n", m.coAvg))
-
-	b.WriteString("# HELP lakehouse_pulse_air_quality_updated_at_timestamp_seconds Last timestamp when air quality gauges were updated.\n")
-	b.WriteString("# TYPE lakehouse_pulse_air_quality_updated_at_timestamp_seconds gauge\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_air_quality_updated_at_timestamp_seconds %d\n", m.airQualityUpdatedAt))
-
-	return b.String()
-}
-
 func (m *metricState) observeRun(duration time.Duration, success bool) {
-	seconds := duration.Seconds()
+	m.runTotal.Inc()
+	m.runDuration.Observe(duration.Seconds())
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	m.runTotal++
 	if !success {
-		m.runErrors++
-		m.consecutiveFailures++
+		m.runErrors.Inc()
+		m.currentConsecutive++
+		m.consecutiveFailures.Set(float64(m.currentConsecutive))
 	} else {
-		m.consecutiveFailures = 0
+		m.currentConsecutive = 0
+		m.consecutiveFailures.Set(0)
 		m.lastSuccessUnix = time.Now().Unix()
-	}
-
-	m.durationCount++
-	m.durationSum += seconds
-	for idx, bound := range durationBucketBounds {
-		if seconds <= bound {
-			m.durationBuckets[idx]++
-			return
-		}
+		m.lastSuccess.Set(float64(m.lastSuccessUnix))
 	}
 }
 
 func (m *metricState) incFetchError() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.fetchErrors++
+	m.fetchErrors.Inc()
 }
 
 func (m *metricState) incPublishError() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.publishErrors++
+	m.publishErrors.Inc()
 }
 
 func (m *metricState) incPublished() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.publishTotal++
+	m.publishTotal.Inc()
 }
 
 func (m *metricState) getHealthSnapshot() (lastSuccess int64, failures uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.lastSuccessUnix, m.consecutiveFailures
+	return m.lastSuccessUnix, m.currentConsecutive
 }
 
 func (m *metricState) observeAirQuality(results []map[string]any) {
@@ -627,44 +629,31 @@ func (m *metricState) observeAirQuality(results []map[string]any) {
 	pm10Sum, pm10Count := sumParameter(results, "pm10")
 	coSum, coCount := sumParameter(results, "co")
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	if pm25Count > 0 {
-		m.pm25Avg = pm25Sum / float64(pm25Count)
+		m.pm25Avg.Set(pm25Sum / float64(pm25Count))
 	}
 	if pm10Count > 0 {
-		m.pm10Avg = pm10Sum / float64(pm10Count)
+		m.pm10Avg.Set(pm10Sum / float64(pm10Count))
 	}
 	if coCount > 0 {
-		m.coAvg = coSum / float64(coCount)
+		m.coAvg.Set(coSum / float64(coCount))
 	}
-	m.airQualityUpdatedAt = time.Now().Unix()
+	m.airQualityUpdatedAt.Set(float64(time.Now().Unix()))
 }
 
 func sumParameter(results []map[string]any, parameter string) (float64, int) {
 	sum := 0.0
 	count := 0
 	for _, result := range results {
-		measurements, ok := result["measurements"].([]map[string]any)
+		rawMeasurements, ok := result["measurements"].([]any)
 		if !ok {
-			rawMeasurements, ok := result["measurements"].([]any)
+			continue
+		}
+		for _, item := range rawMeasurements {
+			measurement, ok := item.(map[string]any)
 			if !ok {
 				continue
 			}
-			for _, item := range rawMeasurements {
-				measurement, ok := item.(map[string]any)
-				if !ok {
-					continue
-				}
-				value, include := extractMeasurementValue(measurement, parameter)
-				if include {
-					sum += value
-					count++
-				}
-			}
-			continue
-		}
-		for _, measurement := range measurements {
 			value, include := extractMeasurementValue(measurement, parameter)
 			if include {
 				sum += value
@@ -676,7 +665,10 @@ func sumParameter(results []map[string]any, parameter string) (float64, int) {
 }
 
 func extractMeasurementValue(measurement map[string]any, parameter string) (float64, bool) {
-	name, _ := measurement["parameter"].(string)
+	name, ok := measurement["parameter"].(string)
+	if !ok {
+		return 0, false
+	}
 	name = strings.ToLower(strings.TrimSpace(name))
 	if name != parameter {
 		return 0, false

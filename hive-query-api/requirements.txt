@@ -3,3 +3,4 @@ PyHive==0.7.0
 thrift==0.20.0
 thrift-sasl==0.4.3
 pure-sasl==0.6.2
+pydantic-settings==2.4.0
