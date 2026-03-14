@@ -1,0 +1,42 @@
+groups:
+  - name: lakehouse-pulse-alerts
+    rules:
+      - alert: IngestionNoSuccessfulRun
+        expr: time() - lakehouse_pulse_ingestion_last_success_timestamp_seconds > 5400
+        for: 10m
+        labels:
+          severity: critical
+          service: ingestion
+        annotations:
+          summary: "Ingestion has no successful run for over 90 minutes"
+          description: "Lakehouse Pulse ingestion has not completed a successful poll within the expected hourly window."
+
+      - alert: IngestionConsecutiveFailures
+        expr: lakehouse_pulse_ingestion_consecutive_failures >= 3
+        for: 5m
+        labels:
+          severity: warning
+          service: ingestion
+        annotations:
+          summary: "Ingestion has consecutive failures"
+          description: "Ingestion service reports three or more consecutive failed runs."
+
+      - alert: IngestionPublishErrorRateHigh
+        expr: rate(lakehouse_pulse_ingestion_publish_errors_total[15m]) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+          service: ingestion
+        annotations:
+          summary: "Kafka publish errors are elevated"
+          description: "Ingestion publish error rate is above threshold over the last 15 minutes."
+
+      - alert: IngestionRunErrorRateHigh
+        expr: rate(lakehouse_pulse_ingestion_run_errors_total[30m]) > 0.01
+        for: 15m
+        labels:
+          severity: warning
+          service: ingestion
+        annotations:
+          summary: "Ingestion run error rate is high"
+          description: "Ingestion run failures are higher than expected over the last 30 minutes."
