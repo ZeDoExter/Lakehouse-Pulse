@@ -71,55 +71,56 @@ func (a *AirQualityTool) LatestByCity(ctx context.Context, city string) (LatestA
 
 	candidates := append(preferred, fallback...)
 	for _, chosen := range candidates {
-		sensors, ok := chosen["sensors"].([]any)
-		if !ok || len(sensors) == 0 {
+		locationIDFloat, ok := readFloat(chosen["id"])
+		if !ok {
 			continue
 		}
 
-		parameterToSensor := map[string]int{}
-		for _, item := range sensors {
-			sensor, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			idFloat, ok := readFloat(sensor["id"])
-			if !ok {
-				continue
-			}
-			parameterObj, ok := sensor["parameter"].(map[string]any)
-			if !ok {
-				continue
-			}
-			name, _ := parameterObj["name"].(string)
-			name = strings.ToLower(strings.TrimSpace(name))
-			if name == "pm25" || name == "pm10" || name == "co" {
-				parameterToSensor[name] = int(idFloat)
-			}
+		latestResults, err := a.fetchLocationLatest(ctx, int(locationIDFloat))
+		if err != nil {
+			continue
 		}
 
 		result := LatestAirQualityResponse{}
 		var latest string
-		for _, parameter := range []string{"pm25", "pm10", "co"} {
-			sensorID, ok := parameterToSensor[parameter]
+		for _, res := range latestResults {
+			parameterObj, ok := res["parameter"].(map[string]any)
 			if !ok {
 				continue
 			}
-			value, updatedAt, err := a.fetchLatestSensorHour(ctx, sensorID)
-			if err != nil {
+			parameterName, _ := parameterObj["name"].(string)
+			parameterName = strings.ToLower(strings.TrimSpace(parameterName))
+
+			if parameterName != "pm25" && parameterName != "pm10" && parameterName != "co" {
 				continue
 			}
-			switch parameter {
+
+			value, ok := readFloat(res["value"])
+			if !ok {
+				continue
+			}
+			datetimeObj, ok := res["datetime"].(map[string]any)
+			if !ok {
+				continue
+			}
+			updatedAt, _ := datetimeObj["utc"].(string)
+
+			switch parameterName {
 			case "pm25":
-				result.PM25 = &value
+				v := value
+				result.PM25 = &v
 			case "pm10":
-				result.PM10 = &value
+				v := value
+				result.PM10 = &v
 			case "co":
-				result.CO = &value
+				v := value
+				result.CO = &v
 			}
 			if updatedAt > latest {
 				latest = updatedAt
 			}
 		}
+
 		if latest != "" {
 			result.UpdatedAt = latest
 			return result, nil
@@ -169,49 +170,39 @@ func (a *AirQualityTool) fetchLocations(ctx context.Context, city string) ([]map
 	return payload.Results, nil
 }
 
-func (a *AirQualityTool) fetchLatestSensorHour(ctx context.Context, sensorID int) (float64, string, error) {
+func (a *AirQualityTool) fetchLocationLatest(ctx context.Context, locationID int) ([]map[string]any, error) {
 	base, err := a.baseURL()
 	if err != nil {
-		return 0, "", err
+		return nil, err
 	}
-	sensorURL := fmt.Sprintf("%s/sensors/%d/hours?limit=1", base, sensorID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sensorURL, nil)
+	latestURL := fmt.Sprintf("%s/locations/%d/latest", base, locationID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latestURL, nil)
 	if err != nil {
-		return 0, "", fmt.Errorf("build sensor request: %w", err)
+		return nil, fmt.Errorf("build latest request: %w", err)
 	}
 	req.Header.Set("X-API-Key", a.APIKey)
 
 	resp, err := a.Client.Do(req)
 	if err != nil {
-		return 0, "", fmt.Errorf("openaq sensor request failed: %w", err)
+		return nil, fmt.Errorf("openaq latest request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0, "", fmt.Errorf("read sensor response: %w", err)
+		return nil, fmt.Errorf("read latest response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return 0, "", fmt.Errorf("openaq sensor status=%d body=%s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("openaq latest status=%d body=%s", resp.StatusCode, string(body))
 	}
 
 	var payload struct {
-		Results []struct {
-			Value  float64 `json:"value"`
-			Period struct {
-				DateTimeTo struct {
-					UTC string `json:"utc"`
-				} `json:"datetimeTo"`
-			} `json:"period"`
-		} `json:"results"`
+		Results []map[string]any `json:"results"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return 0, "", fmt.Errorf("decode sensor response: %w", err)
+		return nil, fmt.Errorf("decode latest response: %w", err)
 	}
-	if len(payload.Results) == 0 {
-		return 0, "", fmt.Errorf("sensor %d returned no hourly values", sensorID)
-	}
-	return payload.Results[0].Value, payload.Results[0].Period.DateTimeTo.UTC, nil
+	return payload.Results, nil
 }
 
 func (a *AirQualityTool) baseURL() (string, error) {

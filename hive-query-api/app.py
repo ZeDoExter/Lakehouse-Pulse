@@ -1,4 +1,3 @@
-import os
 import time
 from datetime import date, datetime
 from decimal import Decimal
@@ -6,31 +5,22 @@ from typing import Any
 
 from flask import Flask, jsonify, request
 from pyhive import hive
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-def env(name: str, default: str) -> str:
-    value = os.getenv(name, "").strip()
-    return value if value else default
+class Settings(BaseSettings):
+    hive_host: str = "hive-server2"
+    hive_port: int = 10000
+    hive_username: str = "root"
+    hive_database: str = "default"
+    hive_query_timeout_seconds: int = 30
+    hive_max_rows: int = 500
+    hive_read_only: bool = True
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 
-def env_int(name: str, default: int) -> int:
-    value = os.getenv(name, "").strip()
-    if not value:
-        return default
-    try:
-        parsed = int(value)
-    except ValueError:
-        return default
-    return parsed if parsed > 0 else default
-
-
-def env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name, "").strip().lower()
-    if not value:
-        return default
-    return value in {"1", "true", "yes", "y", "on"}
-
-
+SETTINGS = Settings()
 ALLOWED_PREFIXES = ("select", "with", "show", "describe", "explain")
 
 APP = Flask(__name__)
@@ -54,25 +44,23 @@ def validate_sql(sql: str, read_only: bool) -> str:
 
 
 def execute_query(sql: str) -> dict[str, Any]:
-    host = env("HIVE_HOST", "hive-server2")
-    port = env_int("HIVE_PORT", 10000)
-    username = env("HIVE_USERNAME", "root")
-    database = env("HIVE_DATABASE", "default")
-    timeout = env_int("HIVE_QUERY_TIMEOUT_SECONDS", 30)
-    max_rows = env_int("HIVE_MAX_ROWS", 500)
-
     started = time.time()
-    connection = hive.Connection(host=host, port=port, username=username, database=database)
+    connection = hive.Connection(
+        host=SETTINGS.hive_host,
+        port=SETTINGS.hive_port,
+        username=SETTINGS.hive_username,
+        database=SETTINGS.hive_database,
+    )
     try:
         cursor = connection.cursor()
         try:
-            cursor.execute(f"SET hive.server2.idle.operation.timeout={timeout * 1000}")
+            cursor.execute(f"SET hive.server2.idle.operation.timeout={SETTINGS.hive_query_timeout_seconds * 1000}")
             cursor.execute(sql)
             if cursor.description is None:
                 rows: list[dict[str, Any]] = []
             else:
                 columns = [column[0] for column in cursor.description]
-                fetched = cursor.fetchmany(max_rows)
+                fetched = cursor.fetchmany(SETTINGS.hive_max_rows)
                 rows = [{columns[i]: json_safe(value) for i, value in enumerate(row)} for row in fetched]
         finally:
             cursor.close()
@@ -93,7 +81,7 @@ def query() -> Any:
     body = request.get_json(silent=True) or {}
     sql = body.get("sql", "")
     try:
-        clean_sql = validate_sql(sql, env_bool("HIVE_READ_ONLY", True))
+        clean_sql = validate_sql(sql, SETTINGS.hive_read_only)
         result = execute_query(clean_sql)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400

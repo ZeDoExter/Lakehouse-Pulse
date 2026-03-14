@@ -8,9 +8,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"lakehousepulse/mcp-server/tools"
 )
 
@@ -33,12 +35,36 @@ type config struct {
 }
 
 type serverMetrics struct {
-	mu              sync.Mutex
-	totalCalls      uint64
-	errorCalls      uint64
-	toolCalls       map[string]uint64
-	toolErrorCalls  map[string]uint64
-	totalDurationMs float64
+	totalCalls      prometheus.Counter
+	errorCalls      prometheus.Counter
+	toolCalls       *prometheus.CounterVec
+	toolErrorCalls  *prometheus.CounterVec
+	totalDurationMs prometheus.Counter
+}
+
+func newServerMetrics() *serverMetrics {
+	return &serverMetrics{
+		totalCalls: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "lakehouse_pulse_mcp_tool_calls_total",
+			Help: "Total number of MCP tool calls.",
+		}),
+		errorCalls: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "lakehouse_pulse_mcp_tool_errors_total",
+			Help: "Total number of MCP tool call errors.",
+		}),
+		toolCalls: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "lakehouse_pulse_mcp_tool_calls_by_tool_total",
+			Help: "Total number of MCP tool calls by tool name.",
+		}, []string{"tool"}),
+		toolErrorCalls: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "lakehouse_pulse_mcp_tool_errors_by_tool_total",
+			Help: "Total number of MCP tool call errors by tool name.",
+		}, []string{"tool"}),
+		totalDurationMs: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "lakehouse_pulse_mcp_tool_duration_ms_sum",
+			Help: "Total duration of MCP tool calls in ms.",
+		}),
+	}
 }
 
 type server struct {
@@ -55,10 +81,7 @@ type server struct {
 func main() {
 	cfg := loadConfig()
 	logger := log.New(os.Stdout, "mcp-server ", log.LstdFlags|log.LUTC)
-	metrics := &serverMetrics{
-		toolCalls:      map[string]uint64{},
-		toolErrorCalls: map[string]uint64{},
-	}
+	metrics := newServerMetrics()
 
 	promTool := tools.NewPrometheusTool(cfg.PrometheusURL, cfg.ToolTimeout)
 	srv := &server{
@@ -80,7 +103,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", srv.handleHealthz)
-	mux.HandleFunc("/metrics", srv.handleMetrics)
+	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/tools/query_hive", srv.handleQueryHive)
 	mux.HandleFunc("/tools/get_pipeline_status", srv.handlePipelineStatus)
 	mux.HandleFunc("/tools/get_air_quality_latest", srv.handleAirQualityLatest)
@@ -102,10 +125,6 @@ func (s *server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (s *server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	_, _ = w.Write([]byte(s.metrics.render()))
-}
 
 func (s *server) handleQueryHive(w http.ResponseWriter, r *http.Request) {
 	s.handleTool("query_hive", w, r, func() (any, error) {
@@ -200,41 +219,13 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func (m *serverMetrics) observe(tool string, durationMs float64, isError bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.totalCalls++
-	m.toolCalls[tool]++
-	m.totalDurationMs += durationMs
+	m.totalCalls.Inc()
+	m.toolCalls.WithLabelValues(tool).Inc()
+	m.totalDurationMs.Add(durationMs)
 	if isError {
-		m.errorCalls++
-		m.toolErrorCalls[tool]++
+		m.errorCalls.Inc()
+		m.toolErrorCalls.WithLabelValues(tool).Inc()
 	}
-}
-
-func (m *serverMetrics) render() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	var b strings.Builder
-	b.WriteString("# HELP lakehouse_pulse_mcp_tool_calls_total Total number of MCP tool calls.\n")
-	b.WriteString("# TYPE lakehouse_pulse_mcp_tool_calls_total counter\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_mcp_tool_calls_total %d\n", m.totalCalls))
-
-	b.WriteString("# HELP lakehouse_pulse_mcp_tool_errors_total Total number of MCP tool call errors.\n")
-	b.WriteString("# TYPE lakehouse_pulse_mcp_tool_errors_total counter\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_mcp_tool_errors_total %d\n", m.errorCalls))
-
-	b.WriteString("# HELP lakehouse_pulse_mcp_tool_duration_ms_sum Total duration of MCP tool calls in ms.\n")
-	b.WriteString("# TYPE lakehouse_pulse_mcp_tool_duration_ms_sum counter\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_mcp_tool_duration_ms_sum %.0f\n", m.totalDurationMs))
-
-	for tool, count := range m.toolCalls {
-		b.WriteString(fmt.Sprintf("lakehouse_pulse_mcp_tool_calls_by_tool_total{tool=%q} %d\n", tool, count))
-	}
-	for tool, count := range m.toolErrorCalls {
-		b.WriteString(fmt.Sprintf("lakehouse_pulse_mcp_tool_errors_by_tool_total{tool=%q} %d\n", tool, count))
-	}
-	return b.String()
 }
 
 func loadConfig() config {
