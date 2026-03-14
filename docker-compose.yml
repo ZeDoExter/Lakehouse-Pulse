@@ -16,7 +16,7 @@ services:
       - OPENAQ_COUNTRY=TH
       - KAFKA_REST_URL=http://kafka-rest:8082
       - KAFKA_TOPIC=openaq.th.latest
-      - POLL_INTERVAL=1h
+      - POLL_INTERVAL=15m
       - HTTP_TIMEOUT=20s
       - MAX_RETRIES=5
       - INITIAL_BACKOFF=2s

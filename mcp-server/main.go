@@ -1,7 +1,7 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"lakehousepulse/mcp-server/tools"
+
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
 
 type config struct {
@@ -32,16 +35,7 @@ type config struct {
 	SparkPythonJob   string
 }
 
-type serverMetrics struct {
-	mu              sync.Mutex
-	totalCalls      uint64
-	errorCalls      uint64
-	toolCalls       map[string]uint64
-	toolErrorCalls  map[string]uint64
-	totalDurationMs float64
-}
-
-type server struct {
+type mcpApp struct {
 	cfg     config
 	logger  *log.Logger
 	metrics *serverMetrics
@@ -52,21 +46,51 @@ type server struct {
 	spark      *tools.SparkTool
 }
 
+type serverMetrics struct {
+	mu              sync.Mutex
+	totalCalls      uint64
+	errorCalls      uint64
+	toolCalls       map[string]uint64
+	toolErrorCalls  map[string]uint64
+	totalDurationMs float64
+}
+
 func main() {
 	cfg := loadConfig()
 	logger := log.New(os.Stdout, "mcp-server ", log.LstdFlags|log.LUTC)
-	metrics := &serverMetrics{
-		toolCalls:      map[string]uint64{},
-		toolErrorCalls: map[string]uint64{},
+	app := newMCPApp(cfg, logger)
+	s := app.newMCPServer()
+	sseServer := server.NewSSEServer(s)
+
+	mux := http.NewServeMux()
+	mux.Handle("/sse", sseServer.SSEHandler())
+	mux.Handle("/message", sseServer.MessageHandler())
+	mux.HandleFunc("/healthz", app.handleHealthz)
+	mux.HandleFunc("/metrics", app.handleMetrics)
+
+	httpServer := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	logger.Printf("starting MCP SSE server on %s (endpoints: /sse, /message; diagnostics: /healthz, /metrics)", cfg.ListenAddr)
+	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logger.Fatalf("server failed: %v", err)
+	}
+}
+
+func newMCPApp(cfg config, logger *log.Logger) *mcpApp {
 	promTool := tools.NewPrometheusTool(cfg.PrometheusURL, cfg.ToolTimeout)
-	srv := &server{
-		cfg:     cfg,
-		logger:  logger,
-		metrics: metrics,
-		hive:    tools.NewHiveTool(cfg.HiveQueryAPIURL, cfg.ToolTimeout),
-		status:  tools.NewStatusTool(promTool, cfg.KafkaLagPromQL, cfg.NamenodeJMXURL, cfg.SparkMasterUIURL, cfg.ToolTimeout),
+	return &mcpApp{
+		cfg:    cfg,
+		logger: logger,
+		metrics: &serverMetrics{
+			toolCalls:      map[string]uint64{},
+			toolErrorCalls: map[string]uint64{},
+		},
+		hive:   tools.NewHiveTool(cfg.HiveQueryAPIURL, cfg.ToolTimeout),
+		status: tools.NewStatusTool(promTool, cfg.KafkaLagPromQL, cfg.NamenodeJMXURL, cfg.SparkMasterUIURL, cfg.ToolTimeout),
 		airQuality: tools.NewAirQualityTool(
 			cfg.OpenAQURL,
 			cfg.OpenAQAPIKey,
@@ -77,131 +101,141 @@ func main() {
 		),
 		spark: tools.NewSparkTool(cfg.SparkSubmitURL, cfg.SparkMaster, cfg.SparkPythonJob, cfg.ToolTimeout),
 	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", srv.handleHealthz)
-	mux.HandleFunc("/metrics", srv.handleMetrics)
-	mux.HandleFunc("/tools/query_hive", srv.handleQueryHive)
-	mux.HandleFunc("/tools/get_pipeline_status", srv.handlePipelineStatus)
-	mux.HandleFunc("/tools/get_air_quality_latest", srv.handleAirQualityLatest)
-	mux.HandleFunc("/tools/trigger_spark_job", srv.handleTriggerSparkJob)
-
-	httpServer := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	logger.Printf("starting on %s", cfg.ListenAddr)
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger.Fatalf("server failed: %v", err)
-	}
 }
 
-func (s *server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+func (a *mcpApp) newMCPServer() *server.MCPServer {
+	s := server.NewMCPServer("lakehouse-pulse", "1.0.0")
+
+	s.AddTool(mcp.NewTool("query_hive",
+		mcp.WithDescription("Query Hive with SQL"),
+		mcp.WithString("sql",
+			mcp.Description("Hive SQL statement"),
+			mcp.Required(),
+		),
+	), a.handleQueryHive)
+
+	s.AddTool(mcp.NewTool("get_pipeline_status",
+		mcp.WithDescription("Get pipeline health from Prometheus, HDFS, and Spark"),
+	), a.handlePipelineStatus)
+
+	s.AddTool(mcp.NewTool("get_air_quality_latest",
+		mcp.WithDescription("Get latest PM2.5/PM10/CO readings for a city"),
+		mcp.WithString("city",
+			mcp.Description("City name, for example Bangkok"),
+			mcp.Required(),
+		),
+	), a.handleAirQualityLatest)
+
+	s.AddTool(mcp.NewTool("trigger_spark_job",
+		mcp.WithDescription("Trigger Spark transform job by job name and date"),
+		mcp.WithString("job",
+			mcp.Description("Job name"),
+			mcp.Required(),
+		),
+		mcp.WithString("date",
+			mcp.Description("Business date in YYYY-MM-DD"),
+			mcp.Required(),
+		),
+	), a.handleTriggerSparkJob)
+
+	return s
 }
 
-func (s *server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	_, _ = w.Write([]byte(s.metrics.render()))
-}
-
-func (s *server) handleQueryHive(w http.ResponseWriter, r *http.Request) {
-	s.handleTool("query_hive", w, r, func() (any, error) {
-		var req struct {
-			SQL string `json:"sql"`
-		}
-		if err := decodeJSON(r, &req); err != nil {
-			return nil, err
-		}
-		if strings.TrimSpace(req.SQL) == "" {
-			return nil, fmt.Errorf("field sql is required")
-		}
-		return s.hive.Query(r.Context(), req.SQL)
-	})
-}
-
-func (s *server) handlePipelineStatus(w http.ResponseWriter, r *http.Request) {
-	s.handleTool("get_pipeline_status", w, r, func() (any, error) {
-		return s.status.GetPipelineStatus(r.Context())
-	})
-}
-
-func (s *server) handleAirQualityLatest(w http.ResponseWriter, r *http.Request) {
-	s.handleTool("get_air_quality_latest", w, r, func() (any, error) {
-		var req struct {
-			City string `json:"city"`
-		}
-		if err := decodeJSON(r, &req); err != nil {
-			return nil, err
-		}
-		if strings.TrimSpace(req.City) == "" {
-			return nil, fmt.Errorf("field city is required")
-		}
-		return s.airQuality.LatestByCity(r.Context(), req.City)
-	})
-}
-
-func (s *server) handleTriggerSparkJob(w http.ResponseWriter, r *http.Request) {
-	s.handleTool("trigger_spark_job", w, r, func() (any, error) {
-		var req struct {
-			Job  string `json:"job"`
-			Date string `json:"date"`
-		}
-		if err := decodeJSON(r, &req); err != nil {
-			return nil, err
-		}
-		if strings.TrimSpace(req.Job) == "" {
-			return nil, fmt.Errorf("field job is required")
-		}
-		if strings.TrimSpace(req.Date) == "" {
-			return nil, fmt.Errorf("field date is required")
-		}
-		return s.spark.Trigger(r.Context(), req.Job, req.Date)
-	})
-}
-
-func (s *server) handleTool(name string, w http.ResponseWriter, r *http.Request, execFn func() (any, error)) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-		return
-	}
+func (a *mcpApp) handleQueryHive(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
-	response, err := execFn()
-	durationMs := float64(time.Since(start).Milliseconds())
-	s.metrics.observe(name, durationMs, err != nil)
-
+	sql, err := request.RequireString("sql")
 	if err != nil {
-		s.logger.Printf("tool=%s status=error err=%q", name, err)
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
+		a.metrics.observe("query_hive", float64(time.Since(start).Milliseconds()), true)
+		return nil, err
 	}
-	writeJSON(w, http.StatusOK, response)
+	if strings.TrimSpace(sql) == "" {
+		a.metrics.observe("query_hive", float64(time.Since(start).Milliseconds()), true)
+		return nil, fmt.Errorf("argument sql is required")
+	}
+	result, err := a.hive.Query(ctx, sql)
+	a.metrics.observe("query_hive", float64(time.Since(start).Milliseconds()), err != nil)
+	if err != nil {
+		a.logger.Printf("tool=query_hive status=error err=%q", err)
+		return nil, err
+	}
+	return mcp.NewToolResultStructuredOnly(result), nil
 }
 
-func decodeJSON(r *http.Request, target any) error {
-	if r.Body == nil {
-		return fmt.Errorf("request body is required")
+func (a *mcpApp) handlePipelineStatus(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+	result, err := a.status.GetPipelineStatus(ctx)
+	a.metrics.observe("get_pipeline_status", float64(time.Since(start).Milliseconds()), err != nil)
+	if err != nil {
+		a.logger.Printf("tool=get_pipeline_status status=error err=%q", err)
+		return nil, err
 	}
-	defer r.Body.Close()
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(target); err != nil {
-		return fmt.Errorf("invalid json body: %w", err)
-	}
-	return nil
+	return mcp.NewToolResultStructuredOnly(result), nil
 }
 
-func writeJSON(w http.ResponseWriter, status int, value any) {
+func (a *mcpApp) handleAirQualityLatest(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+	city, err := request.RequireString("city")
+	if err != nil {
+		a.metrics.observe("get_air_quality_latest", float64(time.Since(start).Milliseconds()), true)
+		return nil, err
+	}
+	if strings.TrimSpace(city) == "" {
+		a.metrics.observe("get_air_quality_latest", float64(time.Since(start).Milliseconds()), true)
+		return nil, fmt.Errorf("argument city is required")
+	}
+	result, err := a.airQuality.LatestByCity(ctx, city)
+	a.metrics.observe("get_air_quality_latest", float64(time.Since(start).Milliseconds()), err != nil)
+	if err != nil {
+		a.logger.Printf("tool=get_air_quality_latest status=error err=%q", err)
+		return nil, err
+	}
+	return mcp.NewToolResultStructuredOnly(result), nil
+}
+
+func (a *mcpApp) handleTriggerSparkJob(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+	job, err := request.RequireString("job")
+	if err != nil {
+		a.metrics.observe("trigger_spark_job", float64(time.Since(start).Milliseconds()), true)
+		return nil, err
+	}
+	date, err := request.RequireString("date")
+	if err != nil {
+		a.metrics.observe("trigger_spark_job", float64(time.Since(start).Milliseconds()), true)
+		return nil, err
+	}
+	if strings.TrimSpace(job) == "" {
+		a.metrics.observe("trigger_spark_job", float64(time.Since(start).Milliseconds()), true)
+		return nil, fmt.Errorf("argument job is required")
+	}
+	if strings.TrimSpace(date) == "" {
+		a.metrics.observe("trigger_spark_job", float64(time.Since(start).Milliseconds()), true)
+		return nil, fmt.Errorf("argument date is required")
+	}
+	result, err := a.spark.Trigger(ctx, job, date)
+	a.metrics.observe("trigger_spark_job", float64(time.Since(start).Milliseconds()), err != nil)
+	if err != nil {
+		a.logger.Printf("tool=trigger_spark_job status=error err=%q", err)
+		return nil, err
+	}
+	return mcp.NewToolResultStructuredOnly(result), nil
+}
+
+func (a *mcpApp) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+func (a *mcpApp) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	_, _ = w.Write([]byte(a.metrics.render()))
 }
 
 func (m *serverMetrics) observe(tool string, durationMs float64, isError bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	m.totalCalls++
 	m.toolCalls[tool]++
 	m.totalDurationMs += durationMs
