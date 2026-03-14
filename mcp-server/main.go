@@ -21,6 +21,7 @@ type config struct {
 	OpenAQURL        string
 	OpenAQAPIKey     string
 	OpenAQCountryID  int
+	OpenAQLimit      int
 	OpenAQCountry    string
 	PrometheusURL    string
 	KafkaLagPromQL   string
@@ -70,6 +71,7 @@ func main() {
 			cfg.OpenAQURL,
 			cfg.OpenAQAPIKey,
 			cfg.OpenAQCountryID,
+			cfg.OpenAQLimit,
 			cfg.OpenAQCountry,
 			cfg.ToolTimeout,
 		),
@@ -243,6 +245,7 @@ func loadConfig() config {
 		OpenAQURL:        getEnv("OPENAQ_URL", "https://api.openaq.org/v3"),
 		OpenAQAPIKey:     getEnv("OPENAQ_API_KEY", ""),
 		OpenAQCountryID:  getInt("OPENAQ_COUNTRY_ID", 111),
+		OpenAQLimit:      getInt("OPENAQ_LOCATION_LIMIT", 3),
 		OpenAQCountry:    getEnv("OPENAQ_COUNTRY", "TH"),
 		PrometheusURL:    getEnv("PROMETHEUS_URL", "http://prometheus:9090"),
 		KafkaLagPromQL:   getEnv("KAFKA_LAG_PROMQL", "max(lakehouse_pulse_ingestion_consecutive_failures)"),

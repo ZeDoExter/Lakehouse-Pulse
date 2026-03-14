@@ -16,6 +16,7 @@ type AirQualityTool struct {
 	OpenAQURL string
 	APIKey    string
 	CountryID int
+	Limit     int
 	Country   string
 	Client    *http.Client
 }
@@ -27,11 +28,15 @@ type LatestAirQualityResponse struct {
 	UpdatedAt string   `json:"updated_at"`
 }
 
-func NewAirQualityTool(openAQURL, apiKey string, countryID int, country string, timeout time.Duration) *AirQualityTool {
+func NewAirQualityTool(openAQURL, apiKey string, countryID, limit int, country string, timeout time.Duration) *AirQualityTool {
+	if limit <= 0 {
+		limit = 3
+	}
 	return &AirQualityTool{
 		OpenAQURL: openAQURL,
 		APIKey:    apiKey,
 		CountryID: countryID,
+		Limit:     limit,
 		Country:   country,
 		Client:    &http.Client{Timeout: timeout},
 	}
@@ -127,7 +132,7 @@ func (a *AirQualityTool) fetchLocations(ctx context.Context) ([]map[string]any, 
 	if err != nil {
 		return nil, err
 	}
-	locationsURL := fmt.Sprintf("%s/locations?countries_id=%d&limit=200", base, a.CountryID)
+	locationsURL := fmt.Sprintf("%s/locations?countries_id=%d&limit=%d", base, a.CountryID, a.Limit)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, locationsURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build locations request: %w", err)
