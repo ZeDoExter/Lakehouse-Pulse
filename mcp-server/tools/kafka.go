@@ -23,6 +23,7 @@ type StatusTool struct {
 	NamenodeJMXURL   string
 	SparkMasterURL   string
 	ComponentTimeout time.Duration
+	client           *http.Client
 }
 
 func NewStatusTool(prometheus *PrometheusTool, kafkaLagQuery, namenodeJMXURL, sparkMasterURL string, timeout time.Duration) *StatusTool {
@@ -32,6 +33,7 @@ func NewStatusTool(prometheus *PrometheusTool, kafkaLagQuery, namenodeJMXURL, sp
 		NamenodeJMXURL:   namenodeJMXURL,
 		SparkMasterURL:   sparkMasterURL,
 		ComponentTimeout: timeout,
+		client:           &http.Client{Timeout: timeout},
 	}
 }
 
@@ -75,7 +77,7 @@ func (s *StatusTool) fetchHDFSUsage(ctx context.Context) (string, float64, error
 	if err != nil {
 		return "", 0, fmt.Errorf("build namenode jmx request: %w", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return "", 0, fmt.Errorf("request namenode jmx: %w", err)
 	}
@@ -117,7 +119,7 @@ func (s *StatusTool) fetchLastSparkJob(ctx context.Context) (string, float64, er
 	if err != nil {
 		return "", 0, fmt.Errorf("build spark request: %w", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return "", 0, fmt.Errorf("request spark master: %w", err)
 	}

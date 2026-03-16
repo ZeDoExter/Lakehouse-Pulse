@@ -5,7 +5,6 @@ services:
     container_name: lp-ingestion
     depends_on:
       - kafka
-      - kafka-rest
     environment:
       - LISTEN_ADDR=:8082
       - OPENAQ_URL=https://api.openaq.org/v3
@@ -14,7 +13,7 @@ services:
       - OPENAQ_LOCATION_LIMIT=3
       - OPENAQ_CITY=Bangkok
       - OPENAQ_COUNTRY=TH
-      - KAFKA_REST_URL=http://kafka-rest:8082
+      - KAFKA_BROKERS=kafka:29092
       - KAFKA_TOPIC=openaq.th.latest
       - POLL_INTERVAL=15m
       - HTTP_TIMEOUT=20s
@@ -36,7 +35,6 @@ services:
       - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
     ports:
       - "9870:9870"
-      - "9000:9000"
     volumes:
       - namenode_data:/hadoop/dfs/name
     networks:
@@ -66,48 +64,25 @@ services:
       - lakehouse
     restart: unless-stopped
 
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.6.1
-    container_name: lp-zookeeper
-    environment:
-      - ZOOKEEPER_CLIENT_PORT=2181
-      - ZOOKEEPER_TICK_TIME=2000
-    ports:
-      - "2181:2181"
-    networks:
-      - lakehouse
-    restart: unless-stopped
-
   kafka:
     image: confluentinc/cp-kafka:7.6.1
     container_name: lp-kafka
-    depends_on:
-      - zookeeper
-    ports:
-      - "9092:9092"
-      - "29092:29092"
     environment:
-      - KAFKA_BROKER_ID=1
-      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
-      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_NODE_ID=1
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - KAFKA_LISTENERS=PLAINTEXT://kafka:29092,CONTROLLER://kafka:9093,PLAINTEXT_HOST://0.0.0.0:9092
       - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
       - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
       - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
-    networks:
-      - lakehouse
-    restart: unless-stopped
-
-  kafka-rest:
-    image: confluentinc/cp-kafka-rest:7.6.1
-    container_name: lp-kafka-rest
-    depends_on:
-      - kafka
-    environment:
-      - KAFKA_REST_HOST_NAME=kafka-rest
-      - KAFKA_REST_LISTENERS=http://0.0.0.0:8082
-      - KAFKA_REST_BOOTSTRAP_SERVERS=PLAINTEXT://kafka:29092
+      - CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qg
     ports:
-      - "8083:8082"
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
     networks:
       - lakehouse
     restart: unless-stopped
@@ -276,32 +251,11 @@ services:
       - lakehouse
     restart: unless-stopped
 
-  hive-query-api:
-    build:
-      context: ./hive-query-api
-    container_name: lp-hive-query-api
-    depends_on:
-      - hive-server2
-    environment:
-      - HIVE_HOST=hive-server2
-      - HIVE_PORT=10000
-      - HIVE_USERNAME=root
-      - HIVE_DATABASE=default
-      - HIVE_QUERY_TIMEOUT_SECONDS=30
-      - HIVE_MAX_ROWS=500
-      - HIVE_READ_ONLY=true
-    ports:
-      - "8085:8085"
-    networks:
-      - lakehouse
-    restart: unless-stopped
-
   mcp-server:
     build:
       context: ./mcp-server
     container_name: lp-mcp-server
     depends_on:
-      - hive-query-api
       - hive-server2
       - spark-master
       - prometheus
@@ -321,7 +275,12 @@ services:
       - SPARK_SUBMIT_URL=http://spark-master:6066/v1/submissions/create
       - SPARK_MASTER=spark://spark-master:7077
       - SPARK_PYTHON_JOB=file:/opt/spark/jobs/transform.py
-      - HIVE_QUERY_API_URL=http://hive-query-api:8085/query
+      - HIVE_HOST=hive-server2
+      - HIVE_PORT=10000
+      - HIVE_USERNAME=root
+      - HIVE_DATABASE=default
+      - HIVE_MAX_ROWS=500
+      - HIVE_READ_ONLY=true
     ports:
       - "8084:8084"
     volumes:
@@ -351,7 +310,6 @@ services:
     image: grafana/grafana:11.1.0
     container_name: lp-grafana
     depends_on:
-      - ingestion
       - prometheus
     environment:
       - GF_SECURITY_ADMIN_USER=admin
@@ -375,6 +333,7 @@ networks:
 volumes:
   namenode_data:
   datanode_data:
+  kafka_data:
   postgres_data:
   prometheus_data:
   grafana_data:

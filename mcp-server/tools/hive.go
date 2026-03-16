@@ -1,18 +1,22 @@
 package tools
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
+	"strings"
 	"time"
+
+	"github.com/beltran/gohive"
 )
 
 type HiveTool struct {
-	QueryAPIURL string
-	Client      *http.Client
+	host     string
+	port     int
+	username string
+	database string
+	timeout  time.Duration
+	maxRows  int
+	readOnly bool
 }
 
 type QueryHiveResponse struct {
@@ -20,47 +24,75 @@ type QueryHiveResponse struct {
 	ExecutionTime string           `json:"execution_time"`
 }
 
-func NewHiveTool(queryAPIURL string, timeout time.Duration) *HiveTool {
+var allowedPrefixes = []string{"select", "with", "show", "describe", "explain"}
+
+func NewHiveTool(host string, port int, username, database string, timeout time.Duration, maxRows int, readOnly bool) *HiveTool {
+	if maxRows <= 0 {
+		maxRows = 500
+	}
 	return &HiveTool{
-		QueryAPIURL: queryAPIURL,
-		Client:      &http.Client{Timeout: timeout},
+		host:     host,
+		port:     port,
+		username: username,
+		database: database,
+		timeout:  timeout,
+		maxRows:  maxRows,
+		readOnly: readOnly,
 	}
 }
 
 func (h *HiveTool) Query(ctx context.Context, sql string) (QueryHiveResponse, error) {
-	if h.QueryAPIURL == "" {
-		return QueryHiveResponse{}, fmt.Errorf("query_hive is not configured: set HIVE_QUERY_API_URL")
+	if h.host == "" {
+		return QueryHiveResponse{}, fmt.Errorf("query_hive is not configured: set HIVE_HOST")
 	}
+	clean := strings.TrimSpace(sql)
+	if h.readOnly {
+		lower := strings.ToLower(clean)
+		allowed := false
+		for _, prefix := range allowedPrefixes {
+			if strings.HasPrefix(lower, prefix) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return QueryHiveResponse{}, fmt.Errorf("only read-only SQL is allowed (SELECT, WITH, SHOW, DESCRIBE, EXPLAIN)")
+		}
+	}
+
+	queryCtx, cancel := context.WithTimeout(ctx, h.timeout)
+	defer cancel()
+
 	started := time.Now()
-	body, err := json.Marshal(map[string]string{"sql": sql})
-	if err != nil {
-		return QueryHiveResponse{}, fmt.Errorf("marshal hive request: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.QueryAPIURL, bytes.NewReader(body))
-	if err != nil {
-		return QueryHiveResponse{}, fmt.Errorf("build hive request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
+	cfg := gohive.NewConnectConfiguration()
+	cfg.Database = h.database
+	cfg.Username = h.username
 
-	resp, err := h.Client.Do(req)
+	conn, err := gohive.Connect(h.host, h.port, "NOSASL", cfg)
 	if err != nil {
-		return QueryHiveResponse{}, fmt.Errorf("hive query request failed: %w", err)
+		return QueryHiveResponse{}, fmt.Errorf("connect to hive-server2 %s:%d: %w", h.host, h.port, err)
 	}
-	defer resp.Body.Close()
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return QueryHiveResponse{}, fmt.Errorf("read hive response: %w", err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return QueryHiveResponse{}, fmt.Errorf("hive query status=%d body=%s", resp.StatusCode, string(responseBody))
+	defer conn.Close()
+
+	cursor := conn.Cursor()
+	defer cursor.Close()
+
+	cursor.Exec(queryCtx, clean)
+	if cursor.Err != nil {
+		return QueryHiveResponse{}, fmt.Errorf("hive exec: %w", cursor.Err)
 	}
 
-	var decoded QueryHiveResponse
-	if err := json.Unmarshal(responseBody, &decoded); err != nil {
-		return QueryHiveResponse{}, fmt.Errorf("decode hive response: %w", err)
+	rows := make([]map[string]any, 0)
+	for cursor.HasMore(queryCtx) && len(rows) < h.maxRows {
+		row := cursor.RowMap(queryCtx)
+		if cursor.Err != nil {
+			break
+		}
+		rows = append(rows, row)
 	}
-	if decoded.ExecutionTime == "" {
-		decoded.ExecutionTime = time.Since(started).String()
-	}
-	return decoded, nil
+
+	return QueryHiveResponse{
+		Rows:          rows,
+		ExecutionTime: time.Since(started).String(),
+	}, nil
 }

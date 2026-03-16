@@ -6,9 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"lakehousepulse/mcp-server/tools"
@@ -16,24 +14,6 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
-
-type config struct {
-	ListenAddr       string
-	ToolTimeout      time.Duration
-	HiveQueryAPIURL  string
-	OpenAQURL        string
-	OpenAQAPIKey     string
-	OpenAQCountryID  int
-	OpenAQLimit      int
-	OpenAQCountry    string
-	PrometheusURL    string
-	KafkaLagPromQL   string
-	NamenodeJMXURL   string
-	SparkMasterUIURL string
-	SparkSubmitURL   string
-	SparkMaster      string
-	SparkPythonJob   string
-}
 
 type mcpApp struct {
 	cfg     config
@@ -44,15 +24,6 @@ type mcpApp struct {
 	status     *tools.StatusTool
 	airQuality *tools.AirQualityTool
 	spark      *tools.SparkTool
-}
-
-type serverMetrics struct {
-	mu              sync.Mutex
-	totalCalls      uint64
-	errorCalls      uint64
-	toolCalls       map[string]uint64
-	toolErrorCalls  map[string]uint64
-	totalDurationMs float64
 }
 
 func main() {
@@ -89,7 +60,7 @@ func newMCPApp(cfg config, logger *log.Logger) *mcpApp {
 			toolCalls:      map[string]uint64{},
 			toolErrorCalls: map[string]uint64{},
 		},
-		hive:   tools.NewHiveTool(cfg.HiveQueryAPIURL, cfg.ToolTimeout),
+		hive:   tools.NewHiveTool(cfg.HiveHost, cfg.HivePort, cfg.HiveUsername, cfg.HiveDatabase, cfg.ToolTimeout, cfg.HiveMaxRows, cfg.HiveReadOnly),
 		status: tools.NewStatusTool(promTool, cfg.KafkaLagPromQL, cfg.NamenodeJMXURL, cfg.SparkMasterUIURL, cfg.ToolTimeout),
 		airQuality: tools.NewAirQualityTool(
 			cfg.OpenAQURL,
@@ -230,95 +201,4 @@ func (a *mcpApp) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 func (a *mcpApp) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	_, _ = w.Write([]byte(a.metrics.render()))
-}
-
-func (m *serverMetrics) observe(tool string, durationMs float64, isError bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.totalCalls++
-	m.toolCalls[tool]++
-	m.totalDurationMs += durationMs
-	if isError {
-		m.errorCalls++
-		m.toolErrorCalls[tool]++
-	}
-}
-
-func (m *serverMetrics) render() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	var b strings.Builder
-	b.WriteString("# HELP lakehouse_pulse_mcp_tool_calls_total Total number of MCP tool calls.\n")
-	b.WriteString("# TYPE lakehouse_pulse_mcp_tool_calls_total counter\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_mcp_tool_calls_total %d\n", m.totalCalls))
-
-	b.WriteString("# HELP lakehouse_pulse_mcp_tool_errors_total Total number of MCP tool call errors.\n")
-	b.WriteString("# TYPE lakehouse_pulse_mcp_tool_errors_total counter\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_mcp_tool_errors_total %d\n", m.errorCalls))
-
-	b.WriteString("# HELP lakehouse_pulse_mcp_tool_duration_ms_sum Total duration of MCP tool calls in ms.\n")
-	b.WriteString("# TYPE lakehouse_pulse_mcp_tool_duration_ms_sum counter\n")
-	b.WriteString(fmt.Sprintf("lakehouse_pulse_mcp_tool_duration_ms_sum %.0f\n", m.totalDurationMs))
-
-	for tool, count := range m.toolCalls {
-		b.WriteString(fmt.Sprintf("lakehouse_pulse_mcp_tool_calls_by_tool_total{tool=%q} %d\n", tool, count))
-	}
-	for tool, count := range m.toolErrorCalls {
-		b.WriteString(fmt.Sprintf("lakehouse_pulse_mcp_tool_errors_by_tool_total{tool=%q} %d\n", tool, count))
-	}
-	return b.String()
-}
-
-func loadConfig() config {
-	return config{
-		ListenAddr:       getEnv("MCP_LISTEN_ADDR", ":8084"),
-		ToolTimeout:      getDuration("MCP_TOOL_TIMEOUT", 15*time.Second),
-		HiveQueryAPIURL:  getEnv("HIVE_QUERY_API_URL", ""),
-		OpenAQURL:        getEnv("OPENAQ_URL", "https://api.openaq.org/v3"),
-		OpenAQAPIKey:     getEnv("OPENAQ_API_KEY", ""),
-		OpenAQCountryID:  getInt("OPENAQ_COUNTRY_ID", 111),
-		OpenAQLimit:      getInt("OPENAQ_LOCATION_LIMIT", 3),
-		OpenAQCountry:    getEnv("OPENAQ_COUNTRY", "TH"),
-		PrometheusURL:    getEnv("PROMETHEUS_URL", "http://prometheus:9090"),
-		KafkaLagPromQL:   getEnv("KAFKA_LAG_PROMQL", "max(lakehouse_pulse_ingestion_consecutive_failures)"),
-		NamenodeJMXURL:   getEnv("NAMENODE_JMX_URL", "http://namenode:9870/jmx"),
-		SparkMasterUIURL: getEnv("SPARK_MASTER_UI_URL", "http://spark-master:8080"),
-		SparkSubmitURL:   getEnv("SPARK_SUBMIT_URL", "http://spark-master:6066/v1/submissions/create"),
-		SparkMaster:      getEnv("SPARK_MASTER", "spark://spark-master:7077"),
-		SparkPythonJob:   getEnv("SPARK_PYTHON_JOB", "file:/opt/spark/jobs/transform.py"),
-	}
-}
-
-func getEnv(key, fallback string) string {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	return value
-}
-
-func getDuration(key string, fallback time.Duration) time.Duration {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	parsed, err := time.ParseDuration(value)
-	if err != nil || parsed <= 0 {
-		return fallback
-	}
-	return parsed
-}
-
-func getInt(key string, fallback int) int {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	parsed, err := strconv.Atoi(value)
-	if err != nil || parsed <= 0 {
-		return fallback
-	}
-	return parsed
 }
