@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,23 +17,49 @@ type openAQResponse struct {
 	Results []map[string]any `json:"results"`
 }
 
-func fetchOpenAQ(ctx context.Context, cfg config, metrics *metricState) ([]map[string]any, error) {
-	client := &http.Client{Timeout: cfg.HTTPTimeout}
+var errOpenAQRequestBudgetExceeded = errors.New("openaq request budget exceeded")
+
+type openAQRequestBudget struct {
+	max  int
+	used int
+}
+
+func newOpenAQRequestBudget(maxReqs int) *openAQRequestBudget {
+	if maxReqs <= 0 {
+		maxReqs = 1
+	}
+	return &openAQRequestBudget{max: maxReqs}
+}
+
+func (b *openAQRequestBudget) consume() bool {
+	if b.used >= b.max {
+		return false
+	}
+	b.used++
+	return true
+}
+
+func (b *openAQRequestBudget) remaining() int {
+	return b.max - b.used
+}
+
+func fetchOpenAQ(ctx context.Context, cfg config, metrics *metricState, client *http.Client) ([]map[string]any, error) {
 	var lastErr error
+	budget := newOpenAQRequestBudget(cfg.OpenAQMaxReqs)
 
 	for attempt := 1; attempt <= cfg.MaxRetries; attempt++ {
-		results, err := fetchOpenAQV3Results(ctx, client, cfg)
+		results, err := fetchOpenAQV3Results(ctx, client, cfg, budget)
 		if err == nil {
 			return results, nil
 		}
 		lastErr = fmt.Errorf("attempt %d OpenAQ v3 fetch failed: %w", attempt, err)
 		metrics.incFetchError()
+		if errors.Is(err, errOpenAQRequestBudgetExceeded) {
+			break
+		}
 
 		if attempt < cfg.MaxRetries {
-			backoff := cfg.InitialBackoff * time.Duration(1<<(attempt-1))
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
+			backoff := min(cfg.InitialBackoff*time.Duration(1<<(attempt-1)), 30*time.Second)
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -44,7 +71,7 @@ func fetchOpenAQ(ctx context.Context, cfg config, metrics *metricState) ([]map[s
 	return nil, lastErr
 }
 
-func fetchOpenAQV3Results(ctx context.Context, client *http.Client, cfg config) ([]map[string]any, error) {
+func fetchOpenAQV3Results(ctx context.Context, client *http.Client, cfg config, budget *openAQRequestBudget) ([]map[string]any, error) {
 	if strings.TrimSpace(cfg.OpenAQAPIKey) == "" {
 		return nil, fmt.Errorf("OPENAQ_API_KEY is required for OpenAQ v3")
 	}
@@ -60,7 +87,7 @@ func fetchOpenAQV3Results(ctx context.Context, client *http.Client, cfg config) 
 		params.Set("cities", city)
 	}
 	locationsURL := fmt.Sprintf("%s/locations?%s", base, params.Encode())
-	locations, err := fetchOpenAQLocations(ctx, client, locationsURL, cfg.OpenAQAPIKey)
+	locations, err := fetchOpenAQLocations(ctx, client, locationsURL, cfg.OpenAQAPIKey, budget)
 	if err != nil {
 		return nil, err
 	}
@@ -70,9 +97,12 @@ func fetchOpenAQV3Results(ctx context.Context, client *http.Client, cfg config) 
 	}
 	results := make([]map[string]any, 0, len(locations))
 	for _, loc := range locations {
-		result, ok := buildResultFromLocation(ctx, client, base, cfg.OpenAQAPIKey, loc, cfg.Country)
+		result, ok := buildResultFromLocation(ctx, client, base, cfg.OpenAQAPIKey, loc, cfg.Country, budget)
 		if ok {
 			results = append(results, result)
+		}
+		if budget.remaining() == 0 {
+			break
 		}
 	}
 	if len(results) == 0 {
@@ -81,7 +111,10 @@ func fetchOpenAQV3Results(ctx context.Context, client *http.Client, cfg config) 
 	return results, nil
 }
 
-func fetchOpenAQLocations(ctx context.Context, client *http.Client, endpoint, apiKey string) ([]map[string]any, error) {
+func fetchOpenAQLocations(ctx context.Context, client *http.Client, endpoint, apiKey string, budget *openAQRequestBudget) ([]map[string]any, error) {
+	if !budget.consume() {
+		return nil, fmt.Errorf("%w: max=%d", errOpenAQRequestBudgetExceeded, budget.max)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build locations request: %w", err)
@@ -129,7 +162,7 @@ func filterLocationsByCity(locations []map[string]any, city string) []map[string
 	return filtered
 }
 
-func buildResultFromLocation(ctx context.Context, client *http.Client, base, apiKey string, location map[string]any, countryCode string) (map[string]any, bool) {
+func buildResultFromLocation(ctx context.Context, client *http.Client, base, apiKey string, location map[string]any, countryCode string, budget *openAQRequestBudget) (map[string]any, bool) {
 	sensors, ok := location["sensors"].([]any)
 	if !ok || len(sensors) == 0 {
 		return nil, false
@@ -158,9 +191,15 @@ func buildResultFromLocation(ctx context.Context, client *http.Client, base, api
 		if seen[parameterName] {
 			continue
 		}
+		if budget.remaining() == 0 {
+			break
+		}
 		units, _ := parameterObj["units"].(string)
-		value, updatedAt, err := fetchSensorHour(ctx, client, base, apiKey, int(sensorIDRaw))
+		value, updatedAt, err := fetchSensorHour(ctx, client, base, apiKey, int(sensorIDRaw), budget)
 		if err != nil {
+			if errors.Is(err, errOpenAQRequestBudgetExceeded) {
+				break
+			}
 			continue
 		}
 		seen[parameterName] = true
@@ -210,7 +249,10 @@ func buildResultFromLocation(ctx context.Context, client *http.Client, base, api
 	}, true
 }
 
-func fetchSensorHour(ctx context.Context, client *http.Client, base, apiKey string, sensorID int) (float64, string, error) {
+func fetchSensorHour(ctx context.Context, client *http.Client, base, apiKey string, sensorID int, budget *openAQRequestBudget) (float64, string, error) {
+	if !budget.consume() {
+		return 0, "", fmt.Errorf("%w: max=%d", errOpenAQRequestBudgetExceeded, budget.max)
+	}
 	endpoint := fmt.Sprintf("%s/sensors/%d/hours?limit=1", base, sensorID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -274,53 +316,6 @@ func readFloatAny(value any) (float64, bool) {
 	default:
 		return 0, false
 	}
-}
-
-func extractMeasurementValue(measurement map[string]any, parameter string) (float64, bool) {
-	name, _ := measurement["parameter"].(string)
-	name = strings.ToLower(strings.TrimSpace(name))
-	if name != parameter {
-		return 0, false
-	}
-	value, ok := readFloatAny(measurement["value"])
-	if !ok {
-		return 0, false
-	}
-	return value, true
-}
-
-func sumParameter(results []map[string]any, parameter string) (float64, int) {
-	sum := 0.0
-	count := 0
-	for _, result := range results {
-		measurements, ok := result["measurements"].([]map[string]any)
-		if !ok {
-			rawMeasurements, ok := result["measurements"].([]any)
-			if !ok {
-				continue
-			}
-			for _, item := range rawMeasurements {
-				measurement, ok := item.(map[string]any)
-				if !ok {
-					continue
-				}
-				value, include := extractMeasurementValue(measurement, parameter)
-				if include {
-					sum += value
-					count++
-				}
-			}
-			continue
-		}
-		for _, measurement := range measurements {
-			value, include := extractMeasurementValue(measurement, parameter)
-			if include {
-				sum += value
-				count++
-			}
-		}
-	}
-	return sum, count
 }
 
 func truncate(value string, max int) string {

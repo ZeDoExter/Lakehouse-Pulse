@@ -16,6 +16,7 @@ func main() {
 	cfg := loadConfig()
 	logger := log.New(os.Stdout, "ingestion ", log.LstdFlags|log.LUTC)
 	metrics := &metricState{durationBuckets: make([]uint64, len(durationBucketBounds))}
+	httpClient := &http.Client{Timeout: cfg.HTTPTimeout}
 	producer := newKafkaProducer(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.HTTPTimeout)
 	defer producer.close()
 
@@ -39,7 +40,7 @@ func main() {
 		}
 	}()
 
-	runIngestionLoop(ctx, cfg, metrics, logger, producer)
+	runIngestionLoop(ctx, cfg, metrics, logger, producer, httpClient)
 	logger.Println("shutdown signal received")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
@@ -49,12 +50,12 @@ func main() {
 	}
 }
 
-func runIngestionLoop(ctx context.Context, cfg config, metrics *metricState, logger *log.Logger, producer *kafkaProducer) {
+func runIngestionLoop(ctx context.Context, cfg config, metrics *metricState, logger *log.Logger, producer *kafkaProducer, client *http.Client) {
 	runID := 0
 	run := func() {
 		runID++
 		start := time.Now()
-		if err := runOnce(ctx, cfg, metrics, logger, producer, runID); err != nil {
+		if err := runOnce(ctx, cfg, metrics, logger, producer, client, runID); err != nil {
 			metrics.observeRun(time.Since(start), false)
 			logger.Printf("run_id=%d status=error err=%q", runID, err)
 			return
@@ -77,8 +78,8 @@ func runIngestionLoop(ctx context.Context, cfg config, metrics *metricState, log
 	}
 }
 
-func runOnce(ctx context.Context, cfg config, metrics *metricState, logger *log.Logger, producer *kafkaProducer, runID int) error {
-	results, err := fetchOpenAQ(ctx, cfg, metrics)
+func runOnce(ctx context.Context, cfg config, metrics *metricState, logger *log.Logger, producer *kafkaProducer, client *http.Client, runID int) error {
+	results, err := fetchOpenAQ(ctx, cfg, metrics, client)
 	if err != nil {
 		return err
 	}
@@ -89,11 +90,12 @@ func runOnce(ctx context.Context, cfg config, metrics *metricState, logger *log.
 	metrics.observeAirQuality(results)
 
 	publishFailures := 0
+	fetchedAt := time.Now().UTC().Format(time.RFC3339)
 	for _, result := range results {
 		record := map[string]any{
 			"source":     "openaq",
 			"country":    cfg.Country,
-			"fetched_at": time.Now().UTC().Format(time.RFC3339),
+			"fetched_at": fetchedAt,
 			"result":     result,
 		}
 		if err := producer.publishWithRetry(ctx, metrics, record, cfg.MaxRetries, cfg.InitialBackoff); err != nil {
@@ -119,10 +121,7 @@ func healthHandler(metrics *metricState, pollInterval time.Duration) http.Handle
 			return
 		}
 
-		maxDelay := int64((2 * pollInterval).Seconds())
-		if maxDelay < 120 {
-			maxDelay = 120
-		}
+		maxDelay := max(int64((2 * pollInterval).Seconds()), 120)
 
 		if now-lastSuccess > maxDelay || failures > 0 {
 			w.WriteHeader(http.StatusServiceUnavailable)

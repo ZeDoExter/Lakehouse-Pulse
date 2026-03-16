@@ -13,6 +13,8 @@ docker compose up -d --build
 docker compose ps
 ```
 
+`OPENAQ_MAX_REQUESTS` defaults to `10` and caps OpenAQ HTTP calls per ingestion poll cycle.
+
 ## URLs
 
 - Grafana: `http://localhost:3000` (`admin/admin`)

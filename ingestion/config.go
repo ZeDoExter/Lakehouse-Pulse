@@ -13,6 +13,7 @@ type config struct {
 	OpenAQAPIKey    string
 	OpenAQCountryID int
 	OpenAQLimit     int
+	OpenAQMaxReqs   int
 	OpenAQCity      string
 	Country         string
 	KafkaBrokers    []string
@@ -31,6 +32,7 @@ func loadConfig() config {
 		OpenAQAPIKey:    getEnv("OPENAQ_API_KEY", ""),
 		OpenAQCountryID: getIntEnv("OPENAQ_COUNTRY_ID", 111),
 		OpenAQLimit:     getIntEnv("OPENAQ_LOCATION_LIMIT", 3),
+		OpenAQMaxReqs:   getIntEnv("OPENAQ_MAX_REQUESTS", 10),
 		OpenAQCity:      getEnv("OPENAQ_CITY", ""),
 		Country:         getEnv("OPENAQ_COUNTRY", "TH"),
 		KafkaBrokers:    strings.Split(getEnv("KAFKA_BROKERS", "kafka:29092"), ","),

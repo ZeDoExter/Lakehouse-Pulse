@@ -16,10 +16,11 @@ type kafkaProducer struct {
 func newKafkaProducer(brokers []string, topic string, writeTimeout time.Duration) *kafkaProducer {
 	return &kafkaProducer{
 		writer: &kafka.Writer{
-			Addr:         kafka.TCP(brokers...),
-			Topic:        topic,
-			Balancer:     &kafka.LeastBytes{},
-			WriteTimeout: writeTimeout,
+			Addr:                   kafka.TCP(brokers...),
+			Topic:                  topic,
+			Balancer:               &kafka.LeastBytes{},
+			WriteTimeout:           writeTimeout,
+			AllowAutoTopicCreation: true,
 		},
 	}
 }
@@ -40,10 +41,7 @@ func (p *kafkaProducer) publishWithRetry(ctx context.Context, metrics *metricSta
 			lastErr = fmt.Errorf("attempt %d publish failed: %w", attempt, err)
 			metrics.incPublishError()
 			if attempt < maxRetries {
-				backoff := initialBackoff * time.Duration(1<<(attempt-1))
-				if backoff > 30*time.Second {
-					backoff = 30 * time.Second
-				}
+				backoff := min(initialBackoff*time.Duration(1<<(attempt-1)), 30*time.Second)
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
